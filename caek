@@ -1,0 +1,1438 @@
+--[[
+    Sena Hub - Cake Mountain Edition (v3.0)
+    Engineered by Axiom
+
+    v3.0 - Navigation rebuilt around the real mountain shape.
+           The mountain is a 6-step stacked cylinder: every step is a sheer
+           108-stud wall with a 60-stud plateau on top. Nothing can walk up it,
+           so route planning is done against the measured step layout instead.
+--]]
+
+-- Clean up any previous instance
+if getgenv()._SenaCakeMountainCleanup then
+    pcall(getgenv()._SenaCakeMountainCleanup)
+end
+
+local SENA_UI_URL = "https://raw.githubusercontent.com/demavieavie/selebewgimang233124jas/refs/heads/main/sadar3223ccsfa"
+local Sena = getgenv().SenaLibOverride or loadstring(game:HttpGet(SENA_UI_URL))()
+
+-- Runtime Settings
+local S = {
+    -- Target zone & farming
+    TargetZone = "Auto (Max Spoon)",
+    AutoSpoon = true,
+    SpoonDelay = 0.15,
+    AlwaysEquipSpoon = true,
+
+    -- Movement
+    AutoWalk = true,
+    MoveMode = "Instant",     -- "Instant" | "Smooth Hop" | "Walk Only"
+    WalkSpeed = 70,
+    HopStep = 40,
+    WalkRange = 220,
+
+    -- Cake collection
+    AutoCollect = true,
+    CollectRange = 180,
+    PrioritizeUncollected = true,
+    TargetRarities = {},   -- filled from CakeConfig.Rarities once it is loaded
+
+    -- Toilet
+    AutoFlushOn100 = true,
+    ReturnAfterFlush = true,
+    FlushReturnDelay = 5,
+
+    -- Progression
+    AutoUpgradeSpoon = true,
+    AutoUpgradeArm = true,
+    AutoUpgradeStomach = true,
+    CrumbReserve = "Keep 25% for Spoon",
+    AutoSellOnFull = true,
+    }
+}
+
+-- Services & References
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local lp = Players.LocalPlayer
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+
+local digRequest = remotes:WaitForChild("DigRequest")
+local buyUpgrade = remotes:WaitForChild("BuyUpgrade")
+local sellAll = remotes:WaitForChild("SellAll")
+local setFavorite = remotes:WaitForChild("SetFavorite")
+local getInventory = remotes:WaitForChild("GetInventory")
+local autoDisplay = remotes:WaitForChild("AutoDisplay")
+local collectionSync = remotes:WaitForChild("CollectionSync")
+local miniCakes = Workspace:WaitForChild("MiniCakes")
+
+local CakeConfig = require(ReplicatedStorage:WaitForChild("CakeConfig"))
+
+-- State
+local collectedMap = {}
+local skipCache = {}
+local isFlushing = false
+local isSelling = false
+local isCollecting = false
+local isRunning = true
+local navId = 0
+local farmAngle = math.random() * math.pi * 2
+local Stats = { bites = 0, dry = 0, advances = 0, slides = 0, moves = 0, collects = 0, flushes = 0 }
+
+local function getHum()
+    local char = lp.Character
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getHRP()
+    local char = lp.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function flatDist(a, b)
+    return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+end
+
+-- CFrame.lookAt hands back a NaN CFrame when the two points coincide, and a
+-- NaN root part is thrown straight out of the world.
+local function safeLookAt(from, to)
+    if not to or (to - from).Magnitude < 0.1 then
+        return CFrame.new(from)
+    end
+    return CFrame.lookAt(from, to)
+end
+
+-- Sync Collection Pokedex
+local colConn = collectionSync.OnClientEvent:Connect(function(data)
+    if type(data) == "table" then
+        if type(data.full) == "table" then
+            for _, id in ipairs(data.full) do
+                collectedMap[id] = true
+            end
+        elseif data.add ~= nil then
+            collectedMap[data.add] = true
+        end
+    end
+end)
+collectionSync:FireServer()
+
+-- ====================================================================
+-- 1. MOUNTAIN MAP - measured, not guessed
+-- ====================================================================
+-- The cake is CakeConfig.ZoneCount stacked cylinders. Each step's top sits
+-- one (height / zones) slice above the last, and each step is narrower than
+-- the one below it. Both numbers are read off the live terrain with rays so
+-- the map stays correct after a reroll or after players chew into it.
+local Map = {
+    cx = 0, cz = 0, height = 648, maxR = 528,
+    zones = 6, step = 108, baseY = 0, topY = 648,
+    axis = "height", isFlat = false,
+    layers = {},          -- [k] = { topY = number, radius = number }
+    stamp = "",
+    at = 0,
+}
+
+local function rayParams()
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = { lp.Character, miniCakes }
+    return rp
+end
+
+function Map.groundY(x, z)
+    local hit = Workspace:Raycast(
+        Vector3.new(x, Map.height + 150, z),
+        Vector3.new(0, -(Map.height + 450), 0),
+        rayParams()
+    )
+    return hit and hit.Position.Y or nil
+end
+
+-- Outermost radius on a given bearing whose ground still reaches wantY.
+local function edgeRadius(wantY, angle)
+    local lo, hi = 0, Map.maxR + 30
+    for _ = 1, 11 do
+        local mid = (lo + hi) * 0.5
+        local gy = Map.groundY(Map.cx + math.cos(angle) * mid, Map.cz + math.sin(angle) * mid)
+        if gy and gy >= wantY - 20 then lo = mid else hi = mid end
+    end
+    return lo
+end
+
+function Map.refresh(force)
+    local cakeId = tostring(ReplicatedStorage:GetAttribute("CurrentCakeId") or "")
+    local axis = ReplicatedStorage:GetAttribute("CurrentCakeAxis")
+    if not axis and cakeId ~= "" then
+        local ok, a = pcall(CakeConfig.cakeAxis, cakeId)
+        if ok and a then axis = a end
+    end
+    axis = axis or "height"
+
+    local stamp = table.concat({
+        cakeId,
+        tostring(ReplicatedStorage:GetAttribute("CurrentCakeHeight")),
+        tostring(ReplicatedStorage:GetAttribute("CurrentCakeMaxRadius")),
+        axis,
+    }, "|")
+    if not force and stamp == Map.stamp and (os.clock() - Map.at) < 45 then return end
+
+    Map.cx = ReplicatedStorage:GetAttribute("CurrentCakeCenterX") or 0
+    Map.cz = ReplicatedStorage:GetAttribute("CurrentCakeCenterZ") or 0
+    Map.height = ReplicatedStorage:GetAttribute("CurrentCakeHeight") or 648
+    Map.maxR = ReplicatedStorage:GetAttribute("CurrentCakeMaxRadius") or 528
+    Map.zones = CakeConfig.ZoneCount or 6
+    Map.step = Map.height / Map.zones
+    Map.baseY = Map.groundY(Map.cx + Map.maxR + 60, Map.cz) or 0
+    Map.axis = axis
+    Map.isFlat = (axis == "core")
+
+    if Map.isFlat then
+        -- On flat cake (e.g. Pancake, Lemon Tart, Blueberry Cheese, Tiramisu),
+        -- the top is a wide plateau at cake height. Zones are concentric rings
+        -- from outer rim (Zone 1) to core center (Zone 6).
+        Map.topY = Map.groundY(Map.cx, Map.cz) or (Map.baseY + Map.height)
+        local layers = {}
+        for k = 1, Map.zones do
+            local zfMid = ((k - 1) + 0.5) / Map.zones
+            local r = (1 - zfMid) * Map.maxR
+            layers[k] = { topY = Map.topY, radius = r }
+        end
+        layers[0] = { topY = Map.baseY, radius = Map.maxR + 100 }
+        Map.layers = layers
+    else
+        local layers = {}
+        for k = 1, Map.zones do
+            local wantY = Map.step * k
+            local samples = {}
+            for a = 0, 5 do
+                samples[#samples + 1] = edgeRadius(wantY, math.rad(a * 60))
+            end
+            table.sort(samples)
+            local radius = (samples[3] + samples[4]) * 0.5
+            -- read the plateau height back off the terrain just inside that edge
+            local topY = Map.groundY(Map.cx + math.max(radius - 12, 0), Map.cz) or (Map.baseY + wantY)
+            layers[k] = { topY = topY, radius = radius }
+        end
+        -- layer 0 is the flat ground ringing the mountain
+        layers[0] = { topY = Map.baseY, radius = Map.maxR + 200 }
+        Map.layers = layers
+        Map.topY = layers[Map.zones] and layers[Map.zones].topY or (Map.baseY + Map.height)
+    end
+    Map.stamp = stamp
+    Map.at = os.clock()
+end
+
+function Map.maxDigY()
+    local tier = tonumber(lp:GetAttribute("SpoonTier")) or 1
+    local zf = CakeConfig.spoonGateZf(tier)
+    if zf == math.huge then return math.huge end
+    return zf * Map.height
+end
+
+function Map.spoonZone()
+    local tier = tonumber(lp:GetAttribute("SpoonTier")) or 1
+    local ok, z = pcall(CakeConfig.spoonZone, tier)
+    return (ok and z) or 1
+end
+
+function Map.targetZone()
+    if S.TargetZone == "Auto (Max Spoon)" then return Map.spoonZone() end
+    local n = tonumber(S.TargetZone:match("Zone (%d+)"))
+    return math.clamp(n or 1, 1, Map.zones)
+end
+
+-- Which plateau do we stand on to chew the wall of the target zone?
+function Map.standLayer()
+    local z = Map.targetZone()
+    return math.clamp(z - 1, 0, Map.zones - 1)
+end
+
+-- Park against the wall of the step above, or on the target zone ring of flat cake.
+local MAX_RECESS = 90
+
+function Map.wallSpot(angle)
+    if Map.isFlat then
+        -- On flat mountain, park directly on top of the cake inside the target zone ring.
+        local z = Map.targetZone()
+        local zfMin = (z - 1) / Map.zones
+        local zfMax = z / Map.zones
+        local zfMid = (zfMin + zfMax) * 0.5
+        -- zf = 1 - (dist / maxR) => dist = (1 - zf) * maxR
+        local targetRadius = math.clamp((1 - zfMid) * Map.maxR, 20, Map.maxR - 15)
+
+        local sx = Map.cx + math.cos(angle) * targetRadius
+        local sz = Map.cz + math.sin(angle) * targetRadius
+        local sy = Map.groundY(sx, sz) or Map.topY
+        if sy < Map.baseY - 10 then sy = Map.topY end
+
+        return Vector3.new(sx, sy + 3.2, sz), sy, targetRadius
+    end
+
+    local k = Map.standLayer()
+    local floor = Map.layers[k]
+    local above = Map.layers[k + 1]
+    if not floor then return nil end
+
+    local plateauY = floor.topY
+
+    -- Top step has nothing above it: dig down into the summit instead.
+    if not above then
+        local radius = math.max(floor.radius * 0.5, 30)
+        local x = Map.cx + math.cos(angle) * radius
+        local z = Map.cz + math.sin(angle) * radius
+        local gy = Map.groundY(x, z) or plateauY
+        return Vector3.new(x, gy + 3.5, z), plateauY, radius
+    end
+
+    local start = above.radius + 20
+    for r = start, math.max(above.radius - MAX_RECESS, 20), -4 do
+        local x = Map.cx + math.cos(angle) * r
+        local z = Map.cz + math.sin(angle) * r
+        local gy = Map.groundY(x, z)
+        if gy and gy > plateauY + 25 then
+            -- Wall face is at r; stand just outside it on the plateau.
+            local stand = r + 11
+            local sx = Map.cx + math.cos(angle) * stand
+            local sz = Map.cz + math.sin(angle) * stand
+            local sy = Map.groundY(sx, sz)
+            if sy and math.abs(sy - plateauY) < 30 then
+                return Vector3.new(sx, sy + 3.5, sz), plateauY, stand
+            end
+        end
+    end
+    return nil, plateauY, nil
+end
+
+Map.refresh(true)
+
+-- ====================================================================
+-- 2. MOVEMENT - straight-line walking plus wall lifts
+-- ====================================================================
+-- PathfindingService is deliberately not used here. Measured on this map it
+-- returns NoPath for every target above the current step (the walls are sheer)
+-- and burns 0.5-9s per query even when it does succeed.
+local Nav = {}
+
+local function applyWalkSpeed()
+    local hum = getHum()
+    if hum and hum.WalkSpeed ~= S.WalkSpeed then
+        hum.WalkSpeed = S.WalkSpeed
+    end
+end
+
+local gliding = false
+
+task.spawn(function()
+    while isRunning do
+        pcall(applyWalkSpeed)
+        -- Safety net: an anchored root that outlives a glide freezes the run.
+        pcall(function()
+            local hrp = getHRP()
+            if hrp and hrp.Anchored and not gliding then hrp.Anchored = false end
+        end)
+        task.wait(1.0)
+    end
+end)
+lp.CharacterAdded:Connect(function()
+    task.wait(0.6)
+    pcall(applyWalkSpeed)
+end)
+
+-- Drop a point onto solid ground. Landing inside terrain gets the character
+-- ejected hard enough to throw it under the map, so a spot we cannot stand on
+-- is refused outright rather than guessed at.
+local function settle(pos)
+    local hit = Workspace:Raycast(pos + Vector3.new(0, 30, 0), Vector3.new(0, -160, 0), rayParams())
+    if hit then
+        return hit.Position + Vector3.new(0, 3.2, 0)
+    end
+    local gy = Map.groundY(pos.X, pos.Z)
+    if gy and math.abs(gy - pos.Y) < 200 then
+        return Vector3.new(pos.X, gy + 3.2, pos.Z)
+    end
+    return nil
+end
+
+-- Reposition the root part. "Smooth Hop" splits the move into steps that stay
+-- inside the server's own movement allowances; "Instant" goes in one write.
+function Nav.blink(targetPos, faceCenter)
+    local hrp = getHRP()
+    if not hrp then return false end
+    if S.MoveMode == "Walk Only" then return false end
+
+    local dest = settle(targetPos)
+    if not dest or dest.Y < 0 or dest.Y > Map.height + 120 then return false end
+
+    -- Two glides at once would fight over the anchor and strand the character.
+    local mode = S.MoveMode
+    if gliding then mode = "Instant" end
+
+    local look = faceCenter and Vector3.new(Map.cx, dest.Y, Map.cz) or (dest + hrp.CFrame.LookVector * 5)
+
+    if mode == "Smooth Hop" then
+        -- Glide there at a fixed rate instead of jumping. The root is held
+        -- still for the trip: stepping an unheld character leaves it falling
+        -- between steps, which turns a 40-stud step into a 200-stud one.
+        local speed = math.max(S.HopStep, 10) * 2
+        gliding = true
+        hrp.Anchored = true
+        local guard = os.clock()
+        while isRunning do
+            local cur = getHRP()
+            if not cur then break end
+            local remaining = dest - cur.Position
+            local left = remaining.Magnitude
+            if left <= 2 or os.clock() - guard > 25 then break end
+            cur.CFrame = CFrame.new(cur.Position + remaining.Unit * math.min(speed * 0.05, left))
+            task.wait(0.05)
+        end
+        gliding = false
+        local cur = getHRP()
+        if cur then cur.Anchored = false end
+    end
+
+    local cur = getHRP()
+    if not cur then return false end
+    cur.CFrame = safeLookAt(dest, look)
+    task.wait(0.25)
+    return true
+end
+
+-- Plain humanoid walking. Flat plateaus have nothing to route around, so a
+-- re-asserted MoveTo beats any waypoint list, and we bail the moment we stall.
+function Nav.walkTo(targetPos, stopDist, maxTime)
+    stopDist = stopDist or 5
+    maxTime = maxTime or 8
+    navId = navId + 1
+    local myId = navId
+
+    local hum, hrp = getHum(), getHRP()
+    if not hum or not hrp then return false end
+
+    local t0 = os.clock()
+    local lastPos = hrp.Position
+    local lastProgress = t0
+
+    while os.clock() - t0 < maxTime do
+        if navId ~= myId or not isRunning or isFlushing then return false end
+        local cur = getHRP()
+        if not cur then return false end
+
+        if (targetPos - cur.Position).Magnitude <= stopDist then return true end
+
+        hum:MoveTo(targetPos)
+
+        if (cur.Position - lastPos).Magnitude > 1.2 then
+            lastPos = cur.Position
+            lastProgress = os.clock()
+        elseif os.clock() - lastProgress > 0.9 then
+            hum.Jump = true
+            if os.clock() - lastProgress > 2.0 then return false end
+        end
+        task.wait(0.1)
+    end
+    local cur = getHRP()
+    return cur and (targetPos - cur.Position).Magnitude <= stopDist
+end
+
+-- The one entry point the rest of the hub uses.
+function Nav.travelTo(targetPos, stopDist, faceCenter)
+    local hrp = getHRP()
+    if not hrp then return false end
+    stopDist = stopDist or 6
+
+    if (targetPos - hrp.Position).Magnitude <= stopDist then return true end
+
+    local dy = targetPos.Y - hrp.Position.Y
+    local flat = flatDist(targetPos, hrp.Position)
+
+    -- Same step, walkable distance: use the legs.
+    if math.abs(dy) <= 8 and flat <= S.WalkRange then
+        if Nav.walkTo(targetPos, stopDist, 10) then return true end
+    end
+
+    if S.MoveMode == "Walk Only" then
+        -- No lift allowed. Only reachable if it happens to be on our step.
+        return Nav.walkTo(targetPos, stopDist, 14)
+    end
+
+    -- Different step, or walking stalled: lift over the wall, then close in.
+    Nav.blink(targetPos, faceCenter)
+    local cur = getHRP()
+    if cur and (targetPos - cur.Position).Magnitude > stopDist then
+        Nav.walkTo(targetPos, stopDist, 4)
+    end
+    cur = getHRP()
+    return cur ~= nil and (targetPos - cur.Position).Magnitude <= stopDist + 4
+end
+
+-- ====================================================================
+-- 3. AUTO EQUIP SPOON
+-- ====================================================================
+local function equipSpoon()
+    local char = lp.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not char:FindFirstChild("Spoon") then
+        local spoon = lp.Backpack:FindFirstChild("Spoon")
+        if spoon and hum then
+            hum:EquipTool(spoon)
+        end
+    end
+end
+
+task.spawn(function()
+    while isRunning do
+        if S.AlwaysEquipSpoon and not isFlushing then
+            pcall(equipSpoon)
+        end
+        task.wait(0.6)
+    end
+end)
+
+-- ====================================================================
+-- 4. DIGGING
+-- ====================================================================
+-- The server only accepts a bite below spoonGateZf(tier) * cake height, and
+-- only within MaxDigDistance plus a speed allowance. Both are read live so an
+-- upgrade widens the reach on its own.
+-- digMax() grows with the character's speed, but the server recomputes it from
+-- whatever velocity it sees when the request lands. Trusting the bonus makes a
+-- share of the bites land out of range and get dropped, so we stay inside the
+-- flat allowance and every bite counts.
+local function digReach()
+    local base = CakeConfig.MaxDigDistance or 16
+    return base - 1.5
+end
+
+local function isBiteLegal(pos)
+    local fullness = tonumber(lp:GetAttribute("Fullness")) or 0
+    if fullness >= 0.999 then return false end
+    local ok, allowed = pcall(
+        CakeConfig.gateAllowed,
+        Map.axis or ReplicatedStorage:GetAttribute("CurrentCakeAxis") or "height",
+        tonumber(lp:GetAttribute("SpoonTier")) or 1,
+        pos,
+        Map.height,
+        Map.maxR,
+        Map.cx,
+        Map.cz
+    )
+    return ok and allowed
+end
+
+-- Pick the HIGHEST legal bite on stepped wall, or closest legal bite on flat cake.
+local function findBite()
+    local hrp = getHRP()
+    if not hrp then return nil end
+    local reach = digReach()
+    local eye = hrp.Position + Vector3.new(0, 1.4, 0)
+    local L = hrp.CFrame.LookVector
+    local R = hrp.CFrame.RightVector
+    local rp = rayParams()
+
+    -- The wall is always the way the mountain narrows, so aim inward as well as
+    -- forward. Facing drifts every time the humanoid takes a step; the inward
+    -- direction does not, and it keeps the bites landing while we shuffle.
+    local flat = Vector3.new(Map.cx - hrp.Position.X, 0, Map.cz - hrp.Position.Z)
+    local C = flat.Magnitude > 1 and flat.Unit or L
+
+    local dirs
+    if Map.isFlat then
+        -- On flat cake, chew downwards into the ground and pocket in front/inward
+        dirs = {
+            Vector3.new(0, -1, 0), -- straight down beneath feet
+            (L + Vector3.new(0, -0.6, 0)).Unit,
+            (L + Vector3.new(0, -1.2, 0)).Unit,
+            (C + Vector3.new(0, -0.6, 0)).Unit,
+            (C + Vector3.new(0, -1.2, 0)).Unit,
+            (L + R * 0.4 + Vector3.new(0, -0.8, 0)).Unit,
+            (L - R * 0.4 + Vector3.new(0, -0.8, 0)).Unit,
+            (C + R * 0.4 + Vector3.new(0, -0.8, 0)).Unit,
+            (C - R * 0.4 + Vector3.new(0, -0.8, 0)).Unit,
+            L,
+            C,
+        }
+    else
+        dirs = {
+            (C + Vector3.new(0, 0.9, 0)).Unit,
+            (C + Vector3.new(0, 0.5, 0)).Unit,
+            (C + Vector3.new(0, 0.22, 0)).Unit,
+            C,
+            (L + Vector3.new(0, 0.9, 0)).Unit,
+            (L + Vector3.new(0, 0.5, 0)).Unit,
+            L,
+            (L + R * 0.35 + Vector3.new(0, 0.5, 0)).Unit,
+            (L - R * 0.35 + Vector3.new(0, 0.5, 0)).Unit,
+            (C + Vector3.new(0, -0.45, 0)).Unit,
+        }
+    end
+
+    local capY = Map.isFlat and math.huge or (Map.maxDigY() - 1)
+
+    local best = nil
+    for _, dir in ipairs(dirs) do
+        local hit = Workspace:Raycast(eye, dir * (reach + 10), rp)
+        if hit and hit.Instance == Workspace.Terrain and hit.Position.Y < capY then
+            local d = (hit.Position - hrp.Position).Magnitude
+            if d <= reach and isBiteLegal(hit.Position) then
+                if not best then
+                    best = hit
+                elseif Map.isFlat then
+                    -- On flat cake, prefer closest bite in reach so we chew pocket cleanly
+                    if d < (best.Position - hrp.Position).Magnitude then
+                        best = hit
+                    end
+                else
+                    -- Stepped mountain: prefer highest Y on wall
+                    if hit.Position.Y > best.Position.Y then
+                        best = hit
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+task.spawn(function()
+    while isRunning do
+        if S.AutoSpoon and not isFlushing and not isCollecting then
+            local fullness = tonumber(lp:GetAttribute("Fullness")) or 0
+            if fullness < 0.999 then
+                local hit = findBite()
+                if hit and isBiteLegal(hit.Position) then
+                    digRequest:FireServer(hit.Position, hit.Normal)
+                    Stats.bites = Stats.bites + 1
+                else
+                    Stats.dry = Stats.dry + 1
+                end
+            end
+        end
+        -- The game enforces its own cooldown and lowers it as the scoop levels
+        -- up; firing under it is a wasted call, so track the live value.
+        local cd = tonumber(lp:GetAttribute("DigCooldown")) or 0.4
+        task.wait(math.max(S.SpoonDelay, cd + 0.03))
+    end
+end)
+
+-- ====================================================================
+-- 5. MINI CAKE COLLECTION
+-- ====================================================================
+-- A cake buried inside the mountain has its prompt switched off by the server;
+-- 2 in 3 of them are buried at any moment. Ignoring that flag is what sends a
+-- bot marching at cakes it can never pick up.
+-- Rarity list and ordering come from CakeConfig.Rarities so a new tier added by
+-- the game shows up in the filter on its own. Score is the game's own
+-- valuePerKg, so the ranking never drifts from what a cake is actually worth.
+local RARITY_ORDER, RARITY_WEIGHT = {}, {}
+do
+    local rs = CakeConfig.Rarities
+    if type(rs) == "table" and #rs > 0 then
+        for i, r in ipairs(rs) do
+            local name = type(r) == "table" and r.name or tostring(r)
+            RARITY_ORDER[i] = name
+            RARITY_WEIGHT[name] = math.max(2, (type(r) == "table" and r.valuePerKg or 10) / 40)
+        end
+    else
+        RARITY_ORDER = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic" }
+        RARITY_WEIGHT = { Common = 2, Uncommon = 6, Rare = 14, Epic = 30, Legendary = 70, Mythic = 160 }
+    end
+    for _, name in ipairs(RARITY_ORDER) do
+        S.TargetRarities[name] = true
+    end
+end
+
+-- Fresh copy each call: Sena keeps a reference to whatever list it is handed.
+local function rarityList()
+    local t = {}
+    for i, name in ipairs(RARITY_ORDER) do t[i] = name end
+    return t
+end
+
+-- bandY keeps the search on the layer we are farming. Without it the bot gets
+-- towed down to the cheap cakes ringing the base and never climbs back.
+local function findCake(bandY)
+    local hrp = getHRP()
+    if not hrp then return nil end
+
+    local best, bestScore = nil, -math.huge
+    for _, model in ipairs(miniCakes:GetChildren()) do
+        local rarity, id = model.Name:match("MiniCake_(%w+)_(Cake_[%w_]+)")
+        if rarity and id and not (skipCache[model] and os.clock() - skipCache[model] < 25) then
+            local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt and prompt.Enabled and prompt.Parent and prompt.Parent:IsA("BasePart") then
+                local uncollected = (collectedMap[id] == nil)
+                if S.TargetRarities[rarity] or (S.PrioritizeUncollected and uncollected) then
+                    local part = prompt.Parent
+                    local dist = (part.Position - hrp.Position).Magnitude
+                    local inBand
+                    if Map.isFlat then
+                        inBand = (not bandY) or (part.Position.Y >= Map.baseY - 10 and part.Position.Y <= Map.topY + 60)
+                    else
+                        inBand = (not bandY) or math.abs(part.Position.Y - bandY) <= 70
+                    end
+                    if dist <= S.CollectRange and inBand then
+                        local score = (RARITY_WEIGHT[rarity] or 2)
+                            + (uncollected and 80 or 0)
+                            - dist * 0.35
+                        if score > bestScore then
+                            bestScore = score
+                            best = { model = model, part = part, prompt = prompt, id = id, dist = dist }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- fireproximityprompt does not reach the server for these prompts; a held key
+-- event does. Hold length comes off the prompt itself - big cakes ask for
+-- nearly four seconds.
+local function collectCake(cake)
+    if not cake or cake.model.Parent ~= miniCakes then return false end
+    local hrp = getHRP()
+    if not hrp then return false end
+
+    isCollecting = true
+    local hold = (cake.prompt.HoldDuration or 1.5) + 0.5
+
+    hrp.CFrame = safeLookAt(hrp.Position, Vector3.new(cake.part.Position.X, hrp.Position.Y, cake.part.Position.Z))
+    task.wait(0.15)
+
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+    task.wait(hold)
+    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+
+    for _ = 1, 8 do
+        task.wait(0.2)
+        if cake.model.Parent ~= miniCakes then break end
+    end
+
+    isCollecting = false
+    local got = cake.model.Parent ~= miniCakes
+    if got then Stats.collects = Stats.collects + 1 else skipCache[cake.model] = os.clock() end
+    return got
+end
+
+-- ====================================================================
+-- 6. FARM LOOP
+-- ====================================================================
+-- The loop is deliberately biased towards staying put and biting. Repositioning
+-- is the expensive move here: it throws away the pocket already carved and
+-- leaves the fresh wall out of reach, so it only happens once the current post
+-- has actually stopped producing.
+local dryStreak = 0
+
+task.spawn(function()
+    while isRunning do
+        if S.AutoWalk and not isFlushing and not isCollecting then
+            local ok = pcall(function()
+                Map.refresh(false)
+                local hrp = getHRP()
+                local hum = getHum()
+                if not hrp or not hum then return end
+
+                local _, plateauY = Map.wallSpot(farmAngle)
+                plateauY = plateauY or hrp.Position.Y
+
+                -- Off-band means the post is useless: either we dropped down a
+                -- hole, or we are sitting on a step whose surface is already
+                -- above what the spoon is allowed to touch, where every single
+                -- bite gets refused.
+                local y = hrp.Position.Y
+                local ceiling = Map.maxDigY()
+                local fellOff
+                if Map.isFlat then
+                    local dCenter = flatDist(hrp.Position, Vector3.new(Map.cx, 0, Map.cz))
+                    fellOff = (dCenter > Map.maxR + 35) or (y < Map.baseY - 5)
+                else
+                    fellOff = y < plateauY - 70
+                        or y > plateauY + 35
+                        or (ceiling ~= math.huge and y > ceiling + 8)
+                end
+
+                -- Free pickups first: anything already inside arm's reach.
+                if S.AutoCollect then
+                    local cake = findCake(plateauY)
+                    if cake then
+                        local reach = math.max((cake.prompt.MaxActivationDistance or 13) - 3, 5)
+                        if cake.dist <= reach then
+                            collectCake(cake)
+                            return
+                        end
+                        -- Worth walking for only if it is close and on our step.
+                        if not fellOff and cake.dist <= 90 then
+                            local approach = cake.part.Position + Vector3.new(0, 3, 0)
+                            if Nav.travelTo(approach, reach) then
+                                local cur = getHRP()
+                                if cur and (cake.part.Position - cur.Position).Magnitude <= reach + 3 then
+                                    collectCake(cake)
+                                end
+                            else
+                                skipCache[cake.model] = os.clock()
+                            end
+                            return
+                        end
+                    end
+                end
+
+                -- Still chewing? Then we are exactly where we want to be.
+                if not fellOff and findBite() then
+                    dryStreak = 0
+                    task.wait(0.2)
+                    return
+                end
+
+                -- Nothing in reach. Step into the pocket we just carved.
+                if not fellOff then
+                    local before = hrp.Position
+                    hum:MoveTo(hrp.Position + hrp.CFrame.LookVector * 6)
+                    task.wait(0.4)
+                    if (hrp.Position - before).Magnitude >= 1.5 then
+                        Stats.advances = Stats.advances + 1
+                        dryStreak = 0
+                        return
+                    end
+                end
+
+                dryStreak = dryStreak + 1
+                if dryStreak < 3 and not fellOff then
+                    -- Slide a little way along the wall/ring and try again.
+                    Stats.slides = Stats.slides + 1
+                    farmAngle = farmAngle + (Map.isFlat and 0.08 or 0.05)
+                    local slide = Map.wallSpot(farmAngle)
+                    if slide then
+                        hum:MoveTo(slide)
+                        task.wait(0.4)
+                        local cur = getHRP()
+                        if cur then
+                            cur.CFrame = safeLookAt(cur.Position, Vector3.new(Map.cx, cur.Position.Y, Map.cz))
+                        end
+                    end
+                    return
+                end
+
+                -- Post is spent (or we dropped off the step). Find fresh wall.
+                dryStreak = 0
+                Stats.moves = Stats.moves + 1
+                local spot
+                for _ = 1, 12 do
+                    farmAngle = (farmAngle + 0.45) % (math.pi * 2)
+                    spot = Map.wallSpot(farmAngle)
+                    if spot then break end
+                end
+                if spot then
+                    Nav.travelTo(spot, 8, true)
+                    local cur = getHRP()
+                    if cur then
+                        cur.CFrame = safeLookAt(cur.Position, Vector3.new(Map.cx, cur.Position.Y, Map.cz))
+                    end
+                end
+            end)
+            if not ok then task.wait(0.5) end
+        end
+        task.wait(0.15)
+    end
+end)
+
+-- ====================================================================
+-- 7. AUTO TOILET
+-- ====================================================================
+-- The flush runs a scripted sequence where the server seats the character,
+-- swirls the bowl, empties fullness, and stands the character back up (~3.8s).
+-- Returning before the unseat completes causes the seat weld to snap the player back.
+local function findFlushPrompt()
+    for _, p in ipairs(Workspace:GetDescendants()) do
+        if p:IsA("ProximityPrompt") and p.Name == "FlushPrompt" then
+            return p, p.Parent
+        end
+    end
+    return nil, nil
+end
+
+local function flushToilet()
+    local hrp = getHRP()
+    local hum = getHum()
+    if not hrp or not hum then return false end
+
+    local prompt, tank = findFlushPrompt()
+    if not prompt or not tank then return false end
+
+    local savedCF = hrp.CFrame
+
+    -- Stand directly in front of the toilet
+    local stand = tank.CFrame * CFrame.new(0, 0, -6)
+    local WarpTo = ReplicatedStorage:FindFirstChild("WarpTo")
+    if WarpTo then
+        pcall(function()
+            require(WarpTo).warp("toilet")
+        end)
+    end
+    hrp.CFrame = CFrame.lookAt(stand.Position, tank.Position)
+    task.wait(0.4)
+
+    -- Trigger the flush prompt
+    local t0 = os.clock()
+    local triggered = false
+    if fireproximityprompt then
+        pcall(function()
+            fireproximityprompt(prompt)
+            triggered = true
+        end)
+    end
+    if not triggered then
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait((prompt.HoldDuration or 0.5) + 0.35)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end
+
+    -- 1. Wait for flush sequence to start (player gets seated on the toilet)
+    local tStart = os.clock()
+    while os.clock() - tStart < 2.5 do
+        if hum.Sit then break end
+        task.wait(0.1)
+    end
+
+    -- 2. Wait for Fullness attribute to drain to 0
+    local tDrain = os.clock()
+    while os.clock() - tDrain < 6.0 do
+        if (tonumber(lp:GetAttribute("Fullness")) or 0) < 0.01 then break end
+        task.wait(0.15)
+    end
+
+    -- 3. Wait for the server sequence to stand the player back UP
+    local tStand = os.clock()
+    while os.clock() - tStand < 4.5 do
+        if not hum.Sit then break end
+        task.wait(0.15)
+    end
+
+    -- Safety: force unseat to break any lingering seat weld
+    if hum.Sit then
+        hum.Sit = false
+        task.wait(0.2)
+    end
+
+    -- Respect any configured minimum return delay from trigger
+    while os.clock() - t0 < (S.FlushReturnDelay or 4.5) do
+        task.wait(0.1)
+    end
+
+    if not S.ReturnAfterFlush then return true end
+
+    -- Verify fullness actually drained before returning!
+    local finalFullness = tonumber(lp:GetAttribute("Fullness")) or 0
+    if finalFullness >= 0.5 then
+        -- Flush failed to drain fullness, do not return yet (prevents rapid warp ping-pong)
+        return false
+    end
+
+    -- Return cleanly to farm spot
+    for _ = 1, 3 do
+        local cur = getHRP()
+        if not cur then return true end
+        cur.CFrame = savedCF
+        task.wait(0.35)
+        if (cur.Position - savedCF.Position).Magnitude < 15 then break end
+    end
+    return true
+end
+
+task.spawn(function()
+    while isRunning do
+        if S.AutoFlushOn100 and not isFlushing then
+            local fullness = tonumber(lp:GetAttribute("Fullness")) or 0
+            if fullness >= 0.999 then
+                isFlushing = true
+                navId = navId + 1
+                pcall(flushToilet)
+                Stats.flushes = Stats.flushes + 1
+                task.wait(0.5)
+                isFlushing = false
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ====================================================================
+-- 8. AUTO SELL BACKPACK (ONLY WHEN FULL)
+-- ====================================================================
+task.spawn(function()
+    while isRunning do
+        if S.AutoSellOnFull and not isSelling then
+            local s, inv = pcall(function() return getInventory:InvokeServer() end)
+            if s and type(inv) == "table" and inv.capacity and inv.used then
+                if inv.used >= (inv.capacity - 0.5) and type(inv.items) == "table" and #inv.items > 0 then
+                    isSelling = true
+                    for i, item in ipairs(inv.items) do
+                        local keepRarity = S.KeepRarities[item.rarity] == true
+                        local uncollected = (item.modelId and collectedMap[item.modelId] == nil)
+                        local protect = keepRarity or uncollected
+
+                        if protect and not item.fav then
+                            pcall(function() setFavorite:FireServer(i, true) end)
+                            task.wait(0.02)
+                        elseif not protect and item.fav then
+                            pcall(function() setFavorite:FireServer(i, false) end)
+                            task.wait(0.02)
+                        end
+                    end
+                    pcall(function() sellAll:InvokeServer() end)
+                    task.wait(0.25)
+                    isSelling = false
+                end
+            end
+        end
+        task.wait(1.5)
+    end
+end)
+
+-- ====================================================================
+-- 9. AUTO UPGRADE & SHOWCASE
+-- ====================================================================
+-- BuyUpgrade accepts "Spoon", "Arm", "Arm10", "Stomach" and "Legs". Verified
+-- live: none of them check how far you are from the shop NPC, so the whole
+-- shop works from up on the mountain without ever walking down.
+--
+-- There is no separate backpack upgrade - bag capacity is literally
+-- BagBaseCapacity + ArmLevel (20 + level, confirmed against the live inventory
+-- capacity), so Arm IS the backpack. "Arm10" buys ten at once but is priced
+-- slightly worse per level than ten singles, so singles it is.
+--
+-- Legs is buyable too but only raises base walk speed, which this hub already
+-- overrides, so buying it would burn crumbs for nothing. Deliberately absent.
+
+local RESERVE_FRACTION = {
+    ["Spend Everything"] = 0,
+    ["Keep 25% for Spoon"] = 0.25,
+    ["Keep 50% for Spoon"] = 0.50,
+    ["Keep 75% for Spoon"] = 0.75,
+}
+
+local function crumbs()
+    local n = lp:FindFirstChild("CrumbsNum")
+    return n and n.Value or 0
+end
+
+local lastArmNotify = 0
+
+local function stomachMax()
+    local d = CakeConfig.DoctorUpgrades and CakeConfig.DoctorUpgrades.Stomach
+    return (d and d.max) or 20
+end
+
+task.spawn(function()
+    while isRunning do
+        -- Spoon first: it is the only upgrade that unlocks deeper zones, so it
+        -- gets the crumbs before anything else can nibble at them.
+        if S.AutoUpgradeSpoon then
+            local tier = tonumber(lp:GetAttribute("SpoonTier")) or 1
+            local cost = CakeConfig.spoonCost(tier)
+            if cost and cost > 0 and crumbs() >= cost then
+                local s, res = pcall(function() return buyUpgrade:InvokeServer("Spoon") end)
+                if s and res and res.ok then
+                    Map.refresh(true)
+                    Sena:Notify({
+                        Title = "Spoon Upgraded",
+                        Content = ("Tier %d - reaches zone %d now."):format(res.level or (tier + 1), Map.spoonZone()),
+                        Icon = "sparkles",
+                        Duration = 4,
+                    })
+                end
+            end
+        end
+
+        local reserve = RESERVE_FRACTION[S.CrumbReserve] or 0.25
+        local spendable = crumbs() * (1 - reserve)
+
+        -- Stomach: fewer toilet trips. One level per pass, it is expensive.
+        if S.AutoUpgradeStomach then
+            local lvl = tonumber(lp:GetAttribute("StomachLvl")) or 0
+            if lvl < stomachMax() then
+                local cost = CakeConfig.doctorCost(lvl)
+                if cost and cost > 0 and spendable >= cost then
+                    local s, res = pcall(function() return buyUpgrade:InvokeServer("Stomach") end)
+                    if s and res and res.ok then
+                        spendable = spendable - cost
+                        Sena:Notify({
+                            Title = "Stomach Upgraded",
+                            Content = ("Level %d of %d."):format(res.level or (lvl + 1), stomachMax()),
+                            Icon = "arrow-up-circle",
+                            Duration = 3,
+                        })
+                    end
+                end
+            end
+        end
+
+        -- Arm / bag capacity. Cheap per level, so buy as many as the budget
+        -- covers; capped per pass so a big crumb pile does not turn into one
+        -- long burst of remote calls.
+        if S.AutoUpgradeArm then
+            local bought = 0
+            -- Track the level from the reply rather than re-reading the
+            -- attribute: it replicates back slower than this loop buys, and a
+            -- stale level prices the next one wrong.
+            local lvl = tonumber(lp:GetAttribute("ArmLevel")) or 0
+            for _ = 1, 20 do
+                local cost = CakeConfig.armCost(lvl)
+                if not cost or cost <= 0 or spendable < cost then break end
+                local s, res = pcall(function() return buyUpgrade:InvokeServer("Arm") end)
+                if not (s and res and res.ok) then break end
+                lvl = tonumber(res.level) or (lvl + 1)
+                spendable = spendable - cost
+                bought = bought + 1
+                task.wait(0.05)
+            end
+            if bought > 0 and os.clock() - lastArmNotify > 20 then
+                lastArmNotify = os.clock()
+                Sena:Notify({
+                    Title = "Bag Upgraded",
+                    Content = ("Arm level %d - bag holds %s kg."):format(lvl, CakeConfig.fmtNum(CakeConfig.bagCapacityFor(lvl))),
+                    Icon = "backpack",
+                    Duration = 3,
+                })
+            end
+        end
+
+        if S.AutoPlaceBest then
+            pcall(function() autoDisplay:InvokeServer(S.PlaceMode) end)
+        end
+        task.wait(1.0)
+    end
+end)
+
+-- ====================================================================
+-- 10. SENA UI WINDOW
+-- ====================================================================
+local Window = Sena:CreateWindow({
+    Title      = "Sena",
+    SubTitle   = "Cake Mountain",
+    Logo       = "rbxassetid://96240498384290",
+    Size       = UDim2.fromOffset(680, 452),
+    Discord    = "dsc.gg/senahub",
+    Version    = "v3.0 | Cake Mountain",
+    ToggleKey  = Enum.KeyCode.RightControl,
+})
+
+-- TAB 1: FARMING
+local FarmTab = Window:CreateTab({ Title = "Farming", Icon = "zap", Description = "Target zone & digging" })
+
+local ZoneOpts = { "Auto (Max Spoon)" }
+for i = 1, (CakeConfig.ZoneCount or 6) do
+    ZoneOpts[#ZoneOpts + 1] = ("Zone %d"):format(i)
+end
+
+local ZoneSec = FarmTab:AddSection({ Title = "Target Zone", Icon = "target", Side = "Left" })
+ZoneSec:AddDropdown({
+    Title = "Farm Zone",
+    Description = "Which layer of the cake to park on and eat. Auto picks the highest your spoon is allowed to touch.",
+    Options = ZoneOpts,
+    -- Sena only shows 5 rows unless told otherwise, which silently hides
+    -- everything past the fifth option.
+    MaxVisible = #ZoneOpts,
+    Default = S.TargetZone,
+    Callback = function(val)
+        S.TargetZone = val
+        Map.refresh(true)
+    end,
+})
+ZoneSec:AddButton({
+    Title = "Re-scan Mountain",
+    Callback = function()
+        Map.refresh(true)
+        local shapeStr = Map.isFlat and "Flat (Radial)" or "Stepped (Tiers)"
+        local target = Map.targetZone()
+        local l = Map.layers[target]
+        local info = Map.isFlat and ("radius %.0f"):format(l and l.radius or 0) or ("height %.0f"):format(l and l.topY or 0)
+        Sena:Notify({
+            Title = "Mountain Scanned",
+            Content = ("%s (%s) - %s, farming zone %d."):format(tostring(ReplicatedStorage:GetAttribute("CurrentCakeName") or "?"), shapeStr, info, target),
+            Icon = "check",
+            Duration = 4,
+        })
+    end,
+})
+
+local SpoonSec = FarmTab:AddSection({ Title = "Digging", Icon = "zap", Side = "Right" })
+SpoonSec:AddToggle({
+    Title = "Auto Dig",
+    Description = "Eats the wall in front of you, always aiming at the highest legal spot.",
+    Default = S.AutoSpoon,
+    Callback = function(val) S.AutoSpoon = val end,
+})
+SpoonSec:AddToggle({
+    Title = "Always Equip Spoon",
+    Description = "Keeps the spoon in hand.",
+    Default = S.AlwaysEquipSpoon,
+    Callback = function(val) S.AlwaysEquipSpoon = val end,
+})
+SpoonSec:AddSlider({
+    Title = "Dig Interval",
+    Description = "Floor only - the game's own cooldown always wins, so leave this low unless you want to dig slower on purpose.",
+    Min = 0.15,
+    Max = 1.0,
+    Increment = 0.05,
+    Default = S.SpoonDelay,
+    Suffix = "s",
+    Callback = function(val) S.SpoonDelay = val end,
+})
+
+-- TAB 2: MOVEMENT
+local MoveTab = Window:CreateTab({ Title = "Movement", Icon = "footprints", Description = "Getting around the cake" })
+local MoveSec = MoveTab:AddSection({ Title = "Navigation", Icon = "footprints", Side = "Left" })
+MoveSec:AddToggle({
+    Title = "Auto Move",
+    Description = "Walks to cakes and holds position on the farming layer.",
+    Default = S.AutoWalk,
+    Callback = function(val) S.AutoWalk = val end,
+})
+MoveSec:AddDropdown({
+    Title = "Travel Mode",
+    MaxVisible = 3,
+    Description = "Instant is fastest. Smooth Hop covers the same ground in short steps. Walk Only never leaves the ground - it cannot climb the layers.",
+    Options = { "Instant", "Smooth Hop", "Walk Only" },
+    Default = S.MoveMode,
+    Callback = function(val) S.MoveMode = val end,
+})
+MoveSec:AddSlider({
+    Title = "Hop Length",
+    Description = "Step size used by Smooth Hop.",
+    Min = 15,
+    Max = 55,
+    Increment = 5,
+    Default = S.HopStep,
+    Suffix = " studs",
+    Callback = function(val) S.HopStep = val end,
+})
+
+local SpeedSec = MoveTab:AddSection({ Title = "Speed", Icon = "gauge", Side = "Right" })
+SpeedSec:AddSlider({
+    Title = "Walk Speed",
+    Description = "Default in this game is 25. Anything above 80 gets flagged.",
+    Min = 25,
+    Max = 80,
+    Increment = 5,
+    Default = S.WalkSpeed,
+    Suffix = "",
+    Callback = function(val)
+        S.WalkSpeed = val
+        pcall(applyWalkSpeed)
+    end,
+})
+SpeedSec:AddSlider({
+    Title = "Walk Range",
+    Description = "Beyond this, travel switches from walking to a lift.",
+    Min = 60,
+    Max = 400,
+    Increment = 20,
+    Default = S.WalkRange,
+    Suffix = " studs",
+    Callback = function(val) S.WalkRange = val end,
+})
+
+-- TAB 3: COLLECTION
+local CollectTab = Window:CreateTab({ Title = "Collection", Icon = "sparkles", Description = "MiniCake harvester" })
+
+local CakeSec = CollectTab:AddSection({ Title = "Harvester", Icon = "sparkles", Side = "Left" })
+CakeSec:AddToggle({
+    Title = "Auto Collect Cakes",
+    Description = "Only chases cakes that are actually dug out - buried ones cannot be picked up.",
+    Default = S.AutoCollect,
+    Callback = function(val) S.AutoCollect = val end,
+})
+CakeSec:AddToggle({
+    Title = "Prioritize Pokedex Uncollected",
+    Description = "Puts cakes missing from your collection first.",
+    Default = S.PrioritizeUncollected,
+    Callback = function(val) S.PrioritizeUncollected = val end,
+})
+CakeSec:AddSlider({
+    Title = "Search Range",
+    Min = 60,
+    Max = 400,
+    Increment = 20,
+    Default = S.CollectRange,
+    Suffix = " studs",
+    Callback = function(val) S.CollectRange = val end,
+})
+
+local FilterSec = CollectTab:AddSection({ Title = "Rarity Filter", Icon = "scan-line", Side = "Right" })
+FilterSec:AddDropdown({
+    Title = "Target Rarities",
+    Multi = true,
+    Options = rarityList(),
+    MaxVisible = #RARITY_ORDER,
+    Default = rarityList(),
+    Callback = function(list)
+        for k in pairs(S.TargetRarities) do S.TargetRarities[k] = false end
+        for _, name in ipairs(list) do S.TargetRarities[name] = true end
+    end,
+})
+
+-- TAB 4: PROGRESSION
+local ProgTab = Window:CreateTab({ Title = "Progression", Icon = "shopping-bag", Description = "Upgrades & selling" })
+
+local UpSec = ProgTab:AddSection({ Title = "Upgrades", Icon = "arrow-up-circle", Side = "Left" })
+UpSec:AddToggle({
+    Title = "Auto Upgrade Spoon",
+    Description = "Buys the next tier as soon as crumbs allow. Each tier unlocks more of the mountain.",
+    Default = S.AutoUpgradeSpoon,
+    Callback = function(val) S.AutoUpgradeSpoon = val end,
+})
+UpSec:AddToggle({
+    Title = "Auto Upgrade Arm / Bag",
+    Description = "Arm level IS your bag capacity - every level is +1 kg. Buys as many as the budget allows.",
+    Default = S.AutoUpgradeArm,
+    Callback = function(val) S.AutoUpgradeArm = val end,
+})
+UpSec:AddToggle({
+    Title = "Auto Upgrade Stomach",
+    Description = "Bigger stomach means fewer toilet trips. Stops at max level.",
+    Default = S.AutoUpgradeStomach,
+    Callback = function(val) S.AutoUpgradeStomach = val end,
+})
+UpSec:AddDropdown({
+    Title = "Crumb Reserve",
+    Description = "How much of the pile stays untouched by Arm and Stomach so the next spoon tier still lands.",
+    Options = { "Spend Everything", "Keep 25% for Spoon", "Keep 50% for Spoon", "Keep 75% for Spoon" },
+    MaxVisible = 4,
+    Default = S.CrumbReserve,
+    Callback = function(val) S.CrumbReserve = val end,
+})
+UpSec:AddToggle({
+    Title = "Auto Place Best Cake",
+    Description = "Displays the highest luck cake on your platter.",
+    Default = S.AutoPlaceBest,
+    Callback = function(val) S.AutoPlaceBest = val end,
+})
+
+local SellSec = ProgTab:AddSection({ Title = "Backpack", Icon = "backpack", Side = "Right" })
+SellSec:AddToggle({
+    Title = "Auto Sell On Full",
+    Description = "Sells the backpack only when it is full.",
+    Default = S.AutoSellOnFull,
+    Callback = function(val) S.AutoSellOnFull = val end,
+})
+SellSec:AddDropdown({
+    Title = "Protected Rarities",
+    Multi = true,
+    Options = { "Rare", "Epic", "Legendary", "Mythic" },
+    MaxVisible = 4,
+    Default = { "Epic", "Legendary", "Mythic" },
+    Callback = function(list)
+        for k in pairs(S.KeepRarities) do S.KeepRarities[k] = false end
+        for _, name in ipairs(list) do S.KeepRarities[name] = true end
+    end,
+})
+
+-- TAB 5: TOILET
+local ToiletTab = Window:CreateTab({ Title = "Toilet", Icon = "bath", Description = "Stomach manager" })
+
+local ToiletSec = ToiletTab:AddSection({ Title = "Auto Toilet", Icon = "bath", Side = "Left" })
+ToiletSec:AddToggle({
+    Title = "Flush on Full Stomach",
+    Description = "Goes as soon as the stomach hits 100%.",
+    Default = S.AutoFlushOn100,
+    Callback = function(val) S.AutoFlushOn100 = val end,
+})
+ToiletSec:AddToggle({
+    Title = "Return To Farm Spot",
+    Description = "Goes straight back to the exact spot you were standing on before the trip.",
+    Default = S.ReturnAfterFlush,
+    Callback = function(val) S.ReturnAfterFlush = val end,
+})
+ToiletSec:AddSlider({
+    Title = "Return Delay",
+    Description = "The flush animation holds you for about 3.6s. Returning sooner than that gets undone.",
+    Min = 3.8,
+    Max = 8.0,
+    Increment = 0.1,
+    Default = S.FlushReturnDelay,
+    Suffix = "s",
+    Callback = function(val) S.FlushReturnDelay = val end,
+})
+
+-- TAB 6: MISC
+local MiscTab = Window:CreateTab({ Title = "Misc", Icon = "settings", Description = "Manual controls" })
+local MiscSec = MiscTab:AddSection({ Title = "Manual", Icon = "gamepad-2", Side = "Left" })
+MiscSec:AddButton({
+    Title = "Go Toilet Now",
+    Callback = function()
+        if isFlushing then return end
+        task.spawn(function()
+            isFlushing = true
+            navId = navId + 1
+            pcall(flushToilet)
+            isFlushing = false
+            Sena:Notify({ Title = "Toilet", Content = "Flushed and back in position.", Icon = "check", Duration = 3 })
+        end)
+    end,
+})
+MiscSec:AddButton({
+    Title = "Sell Backpack",
+    Callback = function()
+        pcall(function() sellAll:InvokeServer() end)
+        Sena:Notify({ Title = "Backpack Sold", Content = "Non-favorited cakes sold.", Icon = "dollar-sign", Duration = 3 })
+    end,
+})
+MiscSec:AddButton({
+    Title = "Re-Equip Spoon",
+    Callback = function()
+        pcall(equipSpoon)
+        Sena:Notify({ Title = "Spoon Equipped", Content = "Spoon back in hand.", Icon = "check", Duration = 2 })
+    end,
+})
+
+local InfoSec = MiscTab:AddSection({ Title = "Status", Icon = "info", Side = "Right" })
+InfoSec:AddButton({
+    Title = "Show Mountain Info",
+    Callback = function()
+        Map.refresh(true)
+        local shapeStr = Map.isFlat and "Flat Cake (Radial Core)" or "Stepped Mountain (Vertical Tiers)"
+        local cap = Map.isFlat and "All Zones Open" or ("up to %.0f high"):format(Map.maxDigY() == math.huge and Map.height or Map.maxDigY())
+        Sena:Notify({
+            Title = ("%s Cake (%s)"):format(tostring(ReplicatedStorage:GetAttribute("CurrentCakeName") or "?"), Map.axis),
+            Content = ("%s - %.0f tall, %d zones. Spoon reaches zone %d (%s)."):format(
+                shapeStr, Map.height, Map.zones, Map.spoonZone(), cap),
+            Icon = "info",
+            Duration = 6,
+        })
+    end,
+})
+
+getgenv()._SenaCakeMountain = { Map = Map, Nav = Nav, S = S, Stats = Stats }
+
+-- Register cleanup
+getgenv()._SenaCakeMountainCleanup = function()
+    isRunning = false
+    gliding = false
+    pcall(function() colConn:Disconnect() end)
+    pcall(function()
+        local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then hrp.Anchored = false end
+    end)
+    pcall(function()
+        local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum.WalkSpeed = CakeConfig.BaseWalkSpeed or 25 end
+    end)
+    pcall(function() Window:Destroy() end)
+end
+
+Sena:Notify({
+    Title = "Sena Hub Loaded",
+    Content = ("Cake Mountain v3.1 - %s (%s), farming zone %d."):format(
+        tostring(ReplicatedStorage:GetAttribute("CurrentCakeName") or "Cake"),
+        Map.isFlat and "Flat" or "Stepped",
+        Map.targetZone()
+    ),
+    Icon = "info",
+    Duration = 5,
+})
