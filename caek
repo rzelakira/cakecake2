@@ -48,6 +48,12 @@ local S = {
     AutoUpgradeStomach = true,
     CrumbReserve = "Keep 25% for Spoon",
     AutoSellOnFull = true,
+    AutoPlaceBest = true,
+    PlaceMode = "luck",
+    KeepRarities = {
+        Epic = true,
+        Legendary = true,
+        Mythic = true,
     }
 }
 
